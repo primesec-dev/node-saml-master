@@ -1,0 +1,151 @@
+import { CacheItem, CacheProvider } from "./types";
+
+export interface CacheProviderOptions {
+  /**
+   * How long a key lasts after it is saved, in milliseconds. Defaults to 8 hours. Set it to the
+   * `requestIdExpirationPeriodMs` of the `SAML` instances that use this cache.
+   */
+  keyExpirationPeriodMs: number;
+}
+
+/**
+ * The `cacheProvider` a `SAML` instance creates when given none. It keeps keys in this process's
+ * memory, so it cannot serve request IDs across servers or processes; supply a shared store there.
+ *
+ * Within one process, pass the same instance to every `SAML` instance for one identity provider,
+ * such as ones constructed per request. Give each identity provider its own instance, or a
+ * response signed by one can answer a request sent to another.
+ */
+export class InMemoryCacheProvider implements CacheProvider {
+  private cacheKeys: Record<string, CacheItem & { expiresAt?: number }>;
+  private options: CacheProviderOptions;
+  private nextPruneMs = 0;
+  private prune: () => void;
+  private removeKeyIfExpired: (key: keyof typeof this.cacheKeys, nowMs: number) => Promise<void>;
+
+  constructor(options: Partial<CacheProviderOptions> = {}) {
+    this.cacheKeys = {};
+
+    this.options = {
+      ...options,
+      keyExpirationPeriodMs: options.keyExpirationPeriodMs ?? 28800000, // 8 hours,
+    };
+
+    // Remove expired cache keys
+    this.prune = () => {
+      const nowMs = new Date().getTime();
+
+      // Don't call this function more than is needed in high-load environments
+      if (nowMs >= this.nextPruneMs) {
+        const keys = Object.keys(this.cacheKeys);
+        const keysToRemove: (keyof typeof this.cacheKeys)[] = [];
+        keys.forEach((key) => {
+          if (nowMs >= this.expiresAt(this.cacheKeys[key])) {
+            keysToRemove.push(key);
+          }
+        });
+
+        // No need to await this because we don't care when it gets done
+        keysToRemove.forEach((key) => this.removeAsync(key));
+        this.nextPruneMs = nowMs + this.options.keyExpirationPeriodMs;
+      }
+    };
+
+    this.removeKeyIfExpired = async (key: keyof typeof this.cacheKeys, nowMs: number) => {
+      if (this.cacheKeys[key] && nowMs >= this.expiresAt(this.cacheKeys[key])) {
+        await this.removeAsync(key);
+      }
+    };
+  }
+
+  /**
+   * Store an item in the cache, using the specified key and value.
+   * Internally will keep track of the time the item was added to the cache
+   */
+  async saveAsync(key: string, value: string): Promise<CacheItem | null> {
+    // Remove all expired keys at a later time
+    this.prune();
+
+    // Remove the key if it is expired
+    const nowMs = new Date().getTime();
+    await this.removeKeyIfExpired(key, nowMs);
+
+    if (!this.cacheKeys[key]) {
+      this.cacheKeys[key] = {
+        createdAt: nowMs,
+        value: value,
+      };
+      return this.cacheKeys[key];
+    } else {
+      return null;
+    }
+  }
+
+  /**
+   * Returns the value of the specified key in the cache
+   */
+  async getAsync(key: string): Promise<string | null> {
+    // Remove all expired keys at a later time
+    this.prune();
+
+    // Remove the key if it is expired
+    const nowMs = new Date().getTime();
+    await this.removeKeyIfExpired(key, nowMs);
+
+    if (this.cacheKeys[key]) {
+      return this.cacheKeys[key].value;
+    } else {
+      return null;
+    }
+  }
+
+  /**
+   * Removes an item from the cache and returns its value, or null if it was absent or expired
+   */
+  async consumeAsync(key: string): Promise<string | null> {
+    const item = this.cacheKeys[key];
+    if (item == null) {
+      return null;
+    }
+
+    delete this.cacheKeys[key];
+    const nowMs = new Date().getTime();
+    return nowMs < this.expiresAt(item) ? item.value : null;
+  }
+
+  /**
+   * Stores an item under a key that is absent or expired, and keeps it until `expiresAtMs`.
+   * Returns whether it stored the item.
+   */
+  async saveIfAbsentAsync(key: string, value: string, expiresAtMs: number): Promise<boolean> {
+    this.prune();
+
+    const nowMs = new Date().getTime();
+    await this.removeKeyIfExpired(key, nowMs);
+
+    if (this.cacheKeys[key]) {
+      return false;
+    }
+    this.cacheKeys[key] = { createdAt: nowMs, value, expiresAt: expiresAtMs };
+    // While keys keep arriving with short expiries, the cache is then swept about that often,
+    // rather than once per keyExpirationPeriodMs.
+    this.nextPruneMs = Math.min(this.nextPruneMs, expiresAtMs);
+    return true;
+  }
+
+  private expiresAt(item: CacheItem & { expiresAt?: number }): number {
+    return item.expiresAt ?? item.createdAt + this.options.keyExpirationPeriodMs;
+  }
+
+  /**
+   * Removes an item from the cache if it exists
+   */
+  async removeAsync(key: string | null): Promise<string | null> {
+    if (key != null && this.cacheKeys[key]) {
+      delete this.cacheKeys[key];
+      return key;
+    } else {
+      return null;
+    }
+  }
+}

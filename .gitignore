@@ -1,0 +1,10 @@
+lib
+node_modules/
+.tern-port
+.idea
+yarn-error.log
+.DS_Store 
+.eslintcache
+.dir-locals.el
+.nyc_output/
+coverage/

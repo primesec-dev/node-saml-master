@@ -1,0 +1,768 @@
+import { SAML } from "../src";
+import * as fs from "fs";
+import * as sinon from "sinon";
+import { SamlConfig } from "../src/types";
+import * as xml from "../src/xml";
+import * as assert from "assert";
+import { expect } from "chai";
+
+const idpCert = fs.readFileSync(__dirname + "/static/cert.pem", "ascii");
+
+describe("Signatures", function () {
+  const INVALID_SIGNATURE = "Invalid signature";
+  const INVALID_DOCUMENT_SIGNATURE = "Invalid document signature";
+  const INVALID_ENCRYPTED_SIGNATURE = "Invalid signature from encrypted assertion";
+  const INVALID_TOO_MANY_TRANSFORMS = "Invalid signature, too many transforms";
+  const INVALID_DOCUMENT_ELEMENT_SIGNATURE = "Invalid signature on documentElement";
+  const INVALID_AMBIGUOUS_ID = "Invalid signature: ID cannot refer to more than one element";
+  const INVALID_DETACHED_REFERENCE =
+    "Invalid signature: reference URI is not a same-document reference";
+  const INVALID_TOO_MANY_SIGNATURES = "Too many signatures found for this element";
+  const INVALID_REFERENCE_NOT_PARENT =
+    "Invalid signature: Referenced node does not refer to its parent element";
+  const INVALID_QUOTE_IN_REFERENCE =
+    "ref URI included quote character ' or \". Not a valid ID, and not allowed";
+  const INVALID_MULTIPLE_ASSERTIONS = "Invalid signature: multiple assertions";
+  const XMLDOM_ERROR =
+    "[xmldom error]\telement parse error: Error: Hierarchy request error: Only one element can be added and only after doctype\n@#[line:57,col:1]";
+
+  const createBody = (pathToXml: string) => ({
+    SAMLResponse: fs.readFileSync(__dirname + "/static/signatures" + pathToXml, "base64"),
+  });
+
+  let validateSignatureSpy: sinon.SinonSpy;
+
+  beforeEach(() => {
+    validateSignatureSpy = sinon.spy(xml, "getVerifiedXml");
+  });
+
+  afterEach(() => {
+    sinon.restore();
+  });
+
+  const testOneResponseBody = async (
+    samlResponseBody: Record<string, string>,
+    shouldErrorWith: string | false,
+    amountOfSignatureChecks = 1,
+    options: Partial<SamlConfig> = {},
+  ) => {
+    //== Instantiate new instance before every test
+    const samlObj = new SAML({
+      callbackUrl: "http://localhost/saml/consume",
+      idpCert,
+      issuer: options.issuer ?? "onesaml_login",
+      audience: false,
+      ...options,
+    });
+
+    //== Run the test in `func`
+    if (shouldErrorWith === false) {
+      await assert.doesNotReject(samlObj.validatePostResponseAsync(samlResponseBody));
+    } else {
+      await assert.rejects(samlObj.validatePostResponseAsync(samlResponseBody), {
+        message: shouldErrorWith,
+      });
+    }
+
+    expect(validateSignatureSpy.callCount).to.equal(amountOfSignatureChecks);
+  };
+
+  const testOneResponse = (
+    pathToXml: string,
+    shouldErrorWith: string | false,
+    amountOfSignaturesChecks: number | undefined,
+    options?: Partial<SamlConfig>,
+  ) => {
+    //== Create a body based on an XML and run the test
+    return async () =>
+      await testOneResponseBody(
+        createBody(pathToXml),
+        shouldErrorWith,
+        amountOfSignaturesChecks,
+        options,
+      );
+  };
+
+  describe("Signatures - Profile.getSamlResponseXml returns the response as received", () => {
+    const validResponse = "/valid/response.root-unsigned.assertion-signed.xml";
+    // The fixture's assertion is long expired in real time, like every other valid one here.
+    const fixtureNow = "2020-09-25T16:59:00Z";
+    const config: SamlConfig = {
+      callbackUrl: "http://localhost/saml/consume",
+      idpCert,
+      issuer: "onesaml_login",
+      audience: false,
+      wantAuthnResponseSigned: false,
+    };
+    let fakeClock: sinon.SinonFakeTimers;
+
+    beforeEach(function () {
+      fakeClock = sinon.useFakeTimers({ now: Date.parse(fixtureNow), toFake: ["Date"] });
+    });
+
+    afterEach(function () {
+      fakeClock.restore();
+    });
+
+    it("returns response-level material that no signature covered", async () => {
+      const received = fs
+        .readFileSync(__dirname + "/static/signatures" + validResponse, "utf8")
+        // The first Issuer is the response's own; the assertion's sits inside the signed element.
+        .replace(
+          "<saml:Issuer>https://evil-corp.com</saml:Issuer>",
+          "<saml:Issuer>https://attacker.example</saml:Issuer>",
+        );
+
+      const { profile } = await new SAML(config).validatePostResponseAsync({
+        SAMLResponse: Buffer.from(received).toString("base64"),
+      });
+      assert.ok(profile != null);
+
+      expect(profile.issuer).to.equal("https://evil-corp.com");
+      expect(profile.getAssertionXml?.()).to.not.contain("https://attacker.example");
+      expect(profile.getSamlResponseXml?.()).to.contain("https://attacker.example");
+    });
+  });
+
+  describe("Signatures - multiple roots are considered invalid", () => {
+    it(
+      "multiple roots => invalid",
+      testOneResponse("/invalid/response.root-signed.multiple-root-elements.xml", XMLDOM_ERROR, 0),
+    );
+  });
+
+  // SAML core 5.4.2: https://docs.oasis-open.org/security/saml/v2.0/saml-core-2.0-os.pdf
+  describe("Signatures - the reference must be a same-document reference", () => {
+    it(
+      "reference URI without the leading # => invalid",
+      testOneResponse(
+        "/invalid/response.root-signed-uri-without-hash.assertion-unsigned.xml",
+        INVALID_DETACHED_REFERENCE,
+        1,
+        { wantAssertionsSigned: false },
+      ),
+    );
+  });
+
+  describe("Signatures - an ambiguous signature is rejected, not resolved", () => {
+    let fakeClock: sinon.SinonFakeTimers;
+
+    beforeEach(function () {
+      fakeClock = sinon.useFakeTimers({
+        now: Date.parse("2020-09-25T16:59:00Z"),
+        toFake: ["Date"],
+      });
+    });
+
+    afterEach(function () {
+      fakeClock.restore();
+    });
+
+    it(
+      "a second signature on the root => error",
+      testOneResponse(
+        "/invalid/response.root-signed-twice.assertion-unsigned.xml",
+        INVALID_TOO_MANY_SIGNATURES,
+        1,
+        { wantAssertionsSigned: false },
+      ),
+    );
+    it(
+      "the assertion's signature moved to the root to pass as a signed response => error",
+      testOneResponse(
+        "/invalid/response.root-carries-assertion-signature.assertion-unsigned.xml",
+        INVALID_REFERENCE_NOT_PARENT,
+        1,
+        { wantAssertionsSigned: false },
+      ),
+    );
+    it(
+      "a quote in the reference URI => error",
+      testOneResponse(
+        "/invalid/response.root-signed-uri-with-quote.assertion-unsigned.xml",
+        INVALID_QUOTE_IN_REFERENCE,
+        1,
+        { wantAssertionsSigned: false },
+      ),
+    );
+    // `getVerifiedXml()` returns nothing for a second reference rather than naming it.
+    it(
+      "a second reference in the root's signature => error",
+      testOneResponse(
+        "/invalid/response.root-signed-2references.assertion-unsigned.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+        { wantAssertionsSigned: false },
+      ),
+    );
+    it(
+      "an unsigned assertion beside the signed one => error",
+      testOneResponse(
+        "/invalid/response.root-unsigned.assertion-signed.assertion-unsigned.xml",
+        INVALID_MULTIPLE_ASSERTIONS,
+        1,
+        { wantAuthnResponseSigned: false },
+      ),
+    );
+  });
+
+  describe("Signatures on saml:Response - Only 1 saml:Assertion", () => {
+    let fakeClock: sinon.SinonFakeTimers;
+
+    beforeEach(function () {
+      fakeClock = sinon.useFakeTimers({
+        now: Date.parse("2020-09-25T16:59:00Z"),
+        toFake: ["Date"],
+      });
+    });
+
+    afterEach(function () {
+      fakeClock.restore();
+    });
+
+    //== VALID
+    it(
+      "R1A - both signed => valid",
+      testOneResponse("/valid/response.root-signed.assertion-signed.xml", false, 2),
+    );
+    const publicKey = fs.readFileSync(__dirname + "/static/pub.pem", "ascii");
+    it(
+      "R1A - both signed, verify using public key => valid",
+      testOneResponse("/valid/response.root-signed.assertion-signed.xml", false, 2, {
+        idpCert: publicKey,
+      }),
+    );
+    const base64PublicKey = publicKey.replace(/-----[^-]+-----|\s/g, "");
+    it(
+      "R1A - public key given as Base64 => error saying Base64 must be a certificate",
+      testOneResponse(
+        "/valid/response.root-signed.assertion-signed.xml",
+        "idpCert is neither valid PEM nor a valid Base64 certificate: Invalid PEM format.",
+        0,
+        { idpCert: base64PublicKey },
+      ),
+    );
+    it(
+      "R1A - public key given as Base64 among several => error naming that one",
+      testOneResponse(
+        "/valid/response.root-signed.assertion-signed.xml",
+        "idpCert[1] is neither valid PEM nor a valid Base64 certificate: Invalid PEM format.",
+        0,
+        { idpCert: [idpCert, base64PublicKey] },
+      ),
+    );
+    it(
+      "R1A - root signed => valid",
+      testOneResponse("/valid/response.root-signed.assertion-unsigned.xml", false, 1, {
+        wantAssertionsSigned: false,
+      }),
+    );
+    it(
+      "R1A - assertion signed => valid",
+      testOneResponse("/valid/response.root-unsigned.assertion-signed.xml", false, 2, {
+        wantAuthnResponseSigned: false,
+      }),
+    );
+    it(
+      "R1A - assertion signed, neither wanted => valid",
+      testOneResponse("/valid/response.root-unsigned.assertion-signed.xml", false, 2, {
+        wantAuthnResponseSigned: false,
+        wantAssertionsSigned: false,
+      }),
+    );
+
+    //== INVALID
+    it(
+      "R1A - root not signed, but required, assertion signed => error",
+      testOneResponse(
+        "/valid/response.root-unsigned.assertion-signed.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+      ),
+    );
+    it(
+      "R1A - none signed => error",
+      testOneResponse(
+        "/invalid/response.root-unsigned.assertion-unsigned.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+      ),
+    );
+    it(
+      "R1A - none signed, none wanted => error",
+      testOneResponse(
+        "/invalid/response.root-unsigned.assertion-unsigned.xml",
+        INVALID_SIGNATURE,
+        2,
+        {
+          wantAuthnResponseSigned: false,
+          wantAssertionsSigned: false,
+        },
+      ),
+    );
+    it(
+      "R1A - both signed => error",
+      testOneResponse(
+        "/invalid/response.root-signed.assertion-signed.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+      ),
+    );
+    it(
+      "R1A - root signed => error",
+      testOneResponse(
+        "/invalid/response.root-signed.assertion-unsigned.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+      ),
+    );
+    it(
+      "R1A - assertion signed => error",
+      testOneResponse(
+        "/invalid/response.root-unsigned.assertion-signed.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+      ),
+    );
+    it(
+      "R1A - root signed - wantAssertionsSigned=true => error",
+      testOneResponse("/valid/response.root-signed.assertion-unsigned.xml", INVALID_SIGNATURE, 2),
+    );
+    it(
+      "R1A - root signed - assertion unsigned encrypted -wantAssertionsSigned=true => error",
+      testOneResponse(
+        "/valid/response.root-signed.assertion-unsigned-encrypted.xml",
+        INVALID_ENCRYPTED_SIGNATURE,
+        2,
+        {
+          decryptionPvk: fs.readFileSync(__dirname + "/static/testshib encryption pvk.pem"),
+        },
+      ),
+    );
+    it(
+      "R1A - root signed - assertion invalidly signed wantAssertionsSigned=true => error",
+      testOneResponse(
+        "/invalid/response.root-signed.assertion-invalidly-signed.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+      ),
+    );
+    it(
+      "R1A - root signed - assertion invalidly signed encrypted wantAssertionsSigned=true => error",
+      testOneResponse(
+        "/invalid/response.root-signed.assertion-invalidly-signed-encrypted.xml",
+        INVALID_ENCRYPTED_SIGNATURE,
+        2,
+        {
+          decryptionPvk: fs.readFileSync(__dirname + "/static/testshib encryption pvk.pem"),
+        },
+      ),
+    );
+    it(
+      "R1A - root signed but with too many transforms => early error",
+      testOneResponse(
+        "/invalid/response.root-signed-transforms.assertion-unsigned.xml",
+        INVALID_TOO_MANY_TRANSFORMS,
+        1,
+      ),
+    );
+    it(
+      "R1A - root unsigned, assertion signed but with too many transforms => early error",
+      testOneResponse(
+        "/invalid/response.root-unsigned.assertion-signed-transforms.xml",
+        INVALID_TOO_MANY_TRANSFORMS,
+        2,
+        {
+          wantAuthnResponseSigned: false,
+        },
+      ),
+    );
+    it(
+      "R1A - root re-signed by attackers own private key and attacker's certificate placed to keyinfo",
+      testOneResponse(
+        "/invalid/response.root-resigned-by-attacker-assertion-unsigned-attackers-cert-at-keyinfo.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+        {
+          wantAssertionsSigned: false,
+        },
+      ),
+    );
+  });
+
+  describe("Signatures on saml:Response - 1 saml:Assertion + 1 saml:Advice containing 1 saml:Assertion", () => {
+    let fakeClock: sinon.SinonFakeTimers;
+
+    beforeEach(function () {
+      fakeClock = sinon.useFakeTimers({
+        now: Date.parse("2020-09-25T16:59:00Z"),
+        toFake: ["Date"],
+      });
+    });
+
+    afterEach(function () {
+      fakeClock.restore();
+    });
+
+    //== VALID
+    it(
+      "R1A1Ad - signed root + assertion + advice => valid",
+      testOneResponse("/valid/response.root-signed.assertion-signed.1advice-signed.xml", false, 2),
+    );
+    it(
+      "R1A1Ad - signed root + assertion => valid",
+      testOneResponse(
+        "/valid/response.root-signed.assertion-signed.1advice-unsigned.xml",
+        false,
+        2,
+      ),
+    );
+    it(
+      "R1A1Ad - signed assertion + advice => valid",
+      testOneResponse(
+        "/valid/response.root-unsigned.assertion-signed.1advice-signed.xml",
+        false,
+        2,
+        { wantAuthnResponseSigned: false },
+      ),
+    );
+    it(
+      "R1A1Ad - signed root => valid",
+      testOneResponse(
+        "/valid/response.root-signed.assertion-unsigned.1advice-unsigned.xml",
+        false,
+        1,
+        {
+          wantAssertionsSigned: false,
+        },
+      ),
+    );
+    it(
+      "R1A1Ad - signed assertion => valid",
+      testOneResponse(
+        "/valid/response.root-unsigned.assertion-signed.1advice-unsigned.xml",
+        false,
+        2,
+        { wantAuthnResponseSigned: false },
+      ),
+    );
+
+    //== INVALID
+    it(
+      "R1A1Ad - signed none => error",
+      testOneResponse(
+        "/invalid/response.root-unsigned.assertion-unsigned.1advice-unsigned.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+      ),
+    );
+    it(
+      "R1A1Ad - signed root + assertion + advice => error",
+      testOneResponse(
+        "/invalid/response.root-signed.assertion-signed.1advice-signed.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+      ),
+    );
+    it(
+      "R1A1Ad - signed root + assertion => error",
+      testOneResponse(
+        "/invalid/response.root-signed.assertion-signed.1advice-unsigned.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+      ),
+    );
+    it(
+      "R1A1Ad - signed assertion + advice => error",
+      testOneResponse(
+        "/invalid/response.root-unsigned.assertion-signed.1advice-signed.xml",
+        INVALID_SIGNATURE,
+        2,
+        { wantAuthnResponseSigned: false },
+      ),
+    );
+    it(
+      "R1A1Ad - signed root => error",
+      testOneResponse(
+        "/invalid/response.root-signed.assertion-unsigned.1advice-unsigned.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+      ),
+    );
+    it(
+      "R1A1Ad - signed assertion => error",
+      testOneResponse(
+        "/invalid/response.root-unsigned.assertion-signed.1advice-unsigned.xml",
+        INVALID_SIGNATURE,
+        2,
+        { wantAuthnResponseSigned: false },
+      ),
+    );
+  });
+
+  describe("Signatures on saml:Response - 1 saml:Assertion + 1 saml:Advice containing 2 saml:Assertion", () => {
+    let fakeClock: sinon.SinonFakeTimers;
+
+    beforeEach(function () {
+      fakeClock = sinon.useFakeTimers({
+        now: Date.parse("2020-09-25T16:59:00Z"),
+        toFake: ["Date"],
+      });
+    });
+
+    afterEach(function () {
+      fakeClock.restore();
+    });
+
+    //== VALID
+    it(
+      "R1A2Ad - signed root + assertion + advice => valid",
+      testOneResponse("/valid/response.root-signed.assertion-signed.2advice-signed.xml", false, 2),
+    );
+    it(
+      "R1A2Ad - signed root + assertion => valid",
+      testOneResponse(
+        "/valid/response.root-signed.assertion-signed.2advice-unsigned.xml",
+        false,
+        2,
+      ),
+    );
+    it(
+      "R1A2Ad - signed root => valid",
+      testOneResponse(
+        "/valid/response.root-signed.assertion-unsigned.2advice-unsigned.xml",
+        false,
+        1,
+        { wantAssertionsSigned: false },
+      ),
+    );
+
+    //== INVALID
+    it(
+      "R1A2Ad - signed none => error",
+      testOneResponse(
+        "/invalid/response.root-unsigned.assertion-unsigned.2advice-unsigned.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+      ),
+    );
+    it(
+      "R1A2Ad - signed root + assertion + advice => error",
+      testOneResponse(
+        "/invalid/response.root-signed.assertion-signed.2advice-signed.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+      ),
+    );
+    it(
+      "R1A2Ad - signed root + assertion => error",
+      testOneResponse(
+        "/invalid/response.root-signed.assertion-signed.2advice-unsigned.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+      ),
+    );
+    it(
+      "R1A2Ad - signed root => error",
+      testOneResponse(
+        "/invalid/response.root-signed.assertion-unsigned.2advice-unsigned.xml",
+        INVALID_DOCUMENT_SIGNATURE,
+        1,
+      ),
+    );
+  });
+
+  describe("Signature on saml:Response with non-LF line endings", () => {
+    let fakeClock: sinon.SinonFakeTimers;
+
+    beforeEach(function () {
+      fakeClock = sinon.useFakeTimers({
+        now: Date.parse("2020-09-25T16:59:00Z"),
+        toFake: ["Date"],
+      });
+    });
+
+    afterEach(function () {
+      fakeClock.restore();
+    });
+
+    const samlResponseXml = fs
+      .readFileSync(
+        __dirname + "/static/signatures/valid/response.root-signed.assertion-signed.xml",
+      )
+      .toString();
+    const makeBody = (str: string) => ({ SAMLResponse: Buffer.from(str).toString("base64") });
+
+    it("CRLF line endings", async () => {
+      const body = makeBody(samlResponseXml.replace(/\n/g, "\r\n"));
+      await testOneResponseBody(body, false, 2);
+    });
+
+    it("CR line endings", async () => {
+      const body = makeBody(samlResponseXml.replace(/\n/g, "\r"));
+      await testOneResponseBody(body, false, 2);
+    });
+  });
+
+  describe("Signature on saml:Response with XML-encoded carriage returns", () => {
+    let fakeClock: sinon.SinonFakeTimers;
+
+    beforeEach(function () {
+      fakeClock = sinon.useFakeTimers({
+        now: Date.parse("2020-09-25T16:59:00Z"),
+        toFake: ["Date"],
+      });
+    });
+
+    afterEach(function () {
+      fakeClock.restore();
+    });
+
+    it(
+      "Attribute with &#13;",
+      testOneResponse("/valid/response.root-signed.assertion-unsigned-13.xml", false, 1, {
+        wantAssertionsSigned: false,
+      }),
+    );
+
+    it(
+      "Attribute with &#xd;",
+      testOneResponse("/valid/response.root-signed.assertion-unsigned-xd.xml", false, 1, {
+        wantAssertionsSigned: false,
+      }),
+    );
+  });
+
+  describe("Signature on saml:Response with XML-encoded carriage returns in signature value and certificate", () => {
+    let fakeClock: sinon.SinonFakeTimers;
+
+    beforeEach(function () {
+      fakeClock = sinon.useFakeTimers({
+        now: Date.parse("2020-09-25T16:59:00Z"),
+        toFake: ["Date"],
+      });
+    });
+
+    afterEach(function () {
+      fakeClock.restore();
+    });
+
+    it(
+      "Signature attributes with &#13;",
+      testOneResponse("/valid/response.root-signed.assertion-unsigned-13-signature.xml", false, 1, {
+        wantAssertionsSigned: false,
+      }),
+    );
+
+    it(
+      "Signature attributes with &#xd;",
+      testOneResponse("/valid/response.root-signed.assertion-unsigned-xd-signature.xml", false, 1, {
+        wantAssertionsSigned: false,
+      }),
+    );
+  });
+
+  describe("Signatures on samlp:LogoutRequest", () => {
+    const createRequestBody = (pathToXml: string) => ({
+      SAMLRequest: fs.readFileSync(__dirname + "/static" + pathToXml, "base64"),
+    });
+
+    const samlObj = () =>
+      new SAML({
+        callbackUrl: "http://localhost/saml/consume",
+        idpCert,
+        issuer: "onesaml_login",
+      });
+
+    const testOneRequest =
+      (pathToXml: string, shouldErrorWith: string, amountOfSignatureChecks = 1) =>
+      async () => {
+        await assert.rejects(samlObj().validatePostRequestAsync(createRequestBody(pathToXml)), {
+          message: shouldErrorWith,
+        });
+
+        expect(validateSignatureSpy.callCount).to.equal(amountOfSignatureChecks);
+      };
+
+    it("root signed => the expected profile, after one signature check", async () => {
+      const { profile } = await samlObj().validatePostRequestAsync(
+        createRequestBody("/logout_request_with_good_signature.xml"),
+      );
+
+      expect(profile.nameID).to.equal("ONELOGIN_f92cc1834efc0f73e9c09f482fce80037a6251e7");
+      expect(validateSignatureSpy.callCount).to.equal(1);
+    });
+
+    it(
+      "signature displaced into samlp:Extensions => error",
+      testOneRequest(
+        "/signatures/invalid/logoutrequest.root-signed.signature-in-extensions.xml",
+        INVALID_DOCUMENT_ELEMENT_SIGNATURE,
+      ),
+    );
+
+    it(
+      "a second element carries the root ID => error",
+      testOneRequest(
+        "/signatures/invalid/logoutrequest.root-signed.duplicate-root-id.xml",
+        INVALID_AMBIGUOUS_ID,
+      ),
+    );
+
+    it(
+      "reference URI without the leading # => error",
+      testOneRequest(
+        "/signatures/invalid/logoutrequest.root-signed.reference-uri-without-hash.xml",
+        INVALID_DETACHED_REFERENCE,
+      ),
+    );
+
+    // `_validateSignature` is the seam v5.1 shipped; the `assert.fail` parsers catch a wider relapse.
+    it("injected dependencies cannot substitute the verification => error", async () => {
+      const substituted = {
+        _validateSignature: () => true,
+        _parseDomFromString: () => assert.fail("the injected parser must not be called"),
+        _parseXml2JsFromString: () => assert.fail("the injected parser must not be called"),
+      };
+
+      await assert.rejects(
+        samlObj().validatePostRequestAsync(
+          createRequestBody(
+            "/signatures/invalid/logoutrequest.root-signed.signature-in-extensions.xml",
+          ),
+          substituted,
+        ),
+        { message: INVALID_DOCUMENT_ELEMENT_SIGNATURE },
+      );
+
+      expect(validateSignatureSpy.callCount, "the library's own verification ran").to.equal(1);
+    });
+  });
+
+  describe("Signature on saml:Response made with sha256-rsa-MGF1", () => {
+    let fakeClock: sinon.SinonFakeTimers;
+
+    beforeEach(function () {
+      fakeClock = sinon.useFakeTimers({
+        now: Date.parse("2020-09-25T16:59:00Z"),
+        toFake: ["Date"],
+      });
+    });
+
+    afterEach(function () {
+      fakeClock.restore();
+    });
+
+    it(
+      "R1A - root signed => valid",
+      testOneResponse(
+        "/valid/response.root-signed.assertion-unsigned.sha256-rsa-mgf1.xml",
+        false,
+        1,
+        {
+          wantAssertionsSigned: false,
+        },
+      ),
+    );
+  });
+});
