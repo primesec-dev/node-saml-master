@@ -80,7 +80,7 @@
     "chai": "^4.5.0",
     "choma": "^1.2.1",
     "concurrently": "^10.0.6",
-    "eslint": "^10.13.0",
+    "eslint": "^10.14.0",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-chai-friendly": "^1.2.1",
     "eslint-plugin-mocha": "^12.0.2",
